@@ -66,7 +66,7 @@ static int use_syslog = 0;
     if (use_syslog) syslog(LOG_INFO, fmt, ##__VA_ARGS__); \
 } while(0)
 
-#define LOG_ERR(fmt, ...) do { \
+#define LOG_ERROR(fmt, ...) do { \
     fprintf(stderr, "[VPN-ERR] " fmt "\n", ##__VA_ARGS__); \
     if (use_syslog) syslog(LOG_ERR, fmt, ##__VA_ARGS__); \
 } while(0)
@@ -384,18 +384,18 @@ void handle_handshake(int sock, int idx,
     unsigned short payload_len = ntohs(msg->length);
 
     if ((size_t)(n - sizeof(message_t)) < payload_len) {
-        LOG_ERR("Truncated handshake from client %d", idx);
+        LOG_ERROR("Truncated handshake from client %d", idx);
         return;
     }
 
     clients[idx].dh_key = generate_dh_key();
-    if (!clients[idx].dh_key) { LOG_ERR("DH key generation failed"); return; }
+    if (!clients[idx].dh_key) { LOG_ERROR("DH key generation failed"); return; }
 
     unsigned char shared_secret[DH_KEY_SIZE];
     size_t secret_len = sizeof(shared_secret);
     if (derive_shared_secret(clients[idx].dh_key, msg->data, payload_len,
                              shared_secret, &secret_len) < 0) {
-        LOG_ERR("Failed to derive shared secret for session %d", idx);
+        LOG_ERROR("Failed to derive shared secret for session %d", idx);
         return;
     }
     derive_aes_key(shared_secret, secret_len, clients[idx].aes_key);
@@ -404,7 +404,7 @@ void handle_handshake(int sock, int idx,
     unsigned char *srv_pub = NULL;
     int srv_pub_len = i2d_PUBKEY(clients[idx].dh_key, &srv_pub);
     if (srv_pub_len <= 0 || srv_pub_len > (int)(ENC_BUF_SIZE - sizeof(message_t))) {
-        LOG_ERR("Server pubkey serialization failed");
+        LOG_ERROR("Server pubkey serialization failed");
         OPENSSL_free(srv_pub);
         return;
     }
@@ -421,7 +421,7 @@ void handle_handshake(int sock, int idx,
     clients[idx].dh_key = NULL;
 
     if (!ip_allocate(clients[idx].virtual_ip, sizeof(clients[idx].virtual_ip))) {
-        LOG_ERR("IP pool exhausted! Rejecting client %d", idx);
+        LOG_ERROR("IP pool exhausted! Rejecting client %d", idx);
         session_free(idx);
         return;
     }
@@ -605,7 +605,7 @@ int main(int argc, char *argv[]) {
                 if (idx >= 0) session_free(idx);
                 idx = session_new(&cli_addr, cli_len);
                 if (idx < 0) {
-                    LOG_ERR("No free session slots!");
+                    LOG_ERROR("No free session slots!");
                     pthread_mutex_unlock(&clients_lock);
                     continue;
                 }
@@ -652,7 +652,7 @@ int main(int argc, char *argv[]) {
                 if (plen > 0) {
                     write(tun_fd_global, plain, plen);
                 } else {
-                    LOG_ERR("Decrypt failed for session %d", idx);
+                    LOG_ERROR("Decrypt failed for session %d", idx);
                 }
             }
             pthread_mutex_unlock(&clients_lock);
