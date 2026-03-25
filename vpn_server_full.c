@@ -1,14 +1,10 @@
 // vpn_server_full.c
 // Complete Lightweight VPN Server - Phase 2 + 3 + 4
-// Features: IP Allocator, Multi-client, NAT/Internet routing
+// AWS EC2 Ready Build
 //
 // Compile: gcc vpn_server_full.c -o vpnserver -lssl -lcrypto -lpthread
 // Run as root: sudo ./vpnserver
 // Setup NAT (run once): sudo ./vpnserver --setup-nat eth0
-//
-// Post-start TUN config:
-//   sudo ip addr add 10.8.0.1/24 dev tun0
-//   sudo ip link set tun0 up
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -30,6 +26,7 @@
 #include <openssl/pem.h>
 #include <openssl/err.h>
 #include <time.h>
+#include <syslog.h>
 
 // ─────────────────────────────────────────────
 //  CONFIGURATION
@@ -42,10 +39,11 @@
 #define AES_TAG_SIZE      16
 #define DH_KEY_SIZE       512
 
-#define MAX_CLIENTS       32          // Phase 3: multi-client
+#define MAX_CLIENTS       32
 #define SESSION_TIMEOUT   300         // seconds of inactivity before cleanup
+#define KEEPALIVE_INTERVAL 30
 
-#define VPN_SUBNET        "10.8.0"    // Virtual IP pool: 10.8.0.2 – 10.8.0.254
+#define VPN_SUBNET        "10.8.0"
 #define VPN_SERVER_IP     "10.8.0.1"
 #define IP_POOL_START     2
 #define IP_POOL_END       254
@@ -57,6 +55,21 @@
 #define MSG_DATA           0x04
 #define MSG_KEEPALIVE      0x05
 #define MSG_DISCONNECT     0x06
+
+// ─────────────────────────────────────────────
+//  LOGGING — goes to both stdout and syslog
+// ─────────────────────────────────────────────
+static int use_syslog = 0;
+
+#define LOG(fmt, ...) do { \
+    printf("[VPN] " fmt "\n", ##__VA_ARGS__); \
+    if (use_syslog) syslog(LOG_INFO, fmt, ##__VA_ARGS__); \
+} while(0)
+
+#define LOG_ERR(fmt, ...) do { \
+    fprintf(stderr, "[VPN-ERR] " fmt "\n", ##__VA_ARGS__); \
+    if (use_syslog) syslog(LOG_ERR, fmt, ##__VA_ARGS__); \
+} while(0)
 
 // ─────────────────────────────────────────────
 //  DATA STRUCTURES
@@ -72,16 +85,16 @@ typedef struct {
     struct sockaddr_in addr;
     socklen_t      addr_len;
     unsigned char  aes_key[AES_KEY_SIZE];
-    char           virtual_ip[32];    // e.g. "10.8.0.3"
+    char           virtual_ip[32];
     time_t         last_seen;
-    EVP_PKEY      *dh_key;            // freed after handshake
+    EVP_PKEY      *dh_key;
     int            handshake_done;
 } client_session_t;
 
 // Global state
 static client_session_t clients[MAX_CLIENTS];
 static pthread_mutex_t  clients_lock = PTHREAD_MUTEX_INITIALIZER;
-static int ip_pool_used[IP_POOL_END + 1];  // 1 = in use
+static int ip_pool_used[IP_POOL_END + 1];
 static int tun_fd_global = -1;
 static int sock_global   = -1;
 static volatile int running = 1;
@@ -99,14 +112,13 @@ int tun_alloc(char *dev) {
     ifr.ifr_name[IFNAMSIZ - 1] = 0;
     if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0) { perror("ioctl TUNSETIFF"); close(fd); exit(1); }
     strcpy(dev, ifr.ifr_name);
-    printf("[TUN] Created interface: %s\n", dev);
+    LOG("Created TUN interface: %s", dev);
     return fd;
 }
 
 // ─────────────────────────────────────────────
-//  MODULE: IP ALLOCATOR  (Phase 2 completion)
+//  MODULE: IP ALLOCATOR
 // ─────────────────────────────────────────────
-// Allocate next free IP from pool; returns 1 on success
 int ip_allocate(char *out_ip, size_t out_len) {
     pthread_mutex_lock(&clients_lock);
     for (int i = IP_POOL_START; i <= IP_POOL_END; i++) {
@@ -118,11 +130,10 @@ int ip_allocate(char *out_ip, size_t out_len) {
         }
     }
     pthread_mutex_unlock(&clients_lock);
-    return 0;   // pool exhausted
+    return 0;
 }
 
 void ip_release(const char *ip) {
-    // Parse last octet
     const char *last_dot = strrchr(ip, '.');
     if (!last_dot) return;
     int octet = atoi(last_dot + 1);
@@ -130,14 +141,13 @@ void ip_release(const char *ip) {
         pthread_mutex_lock(&clients_lock);
         ip_pool_used[octet] = 0;
         pthread_mutex_unlock(&clients_lock);
-        printf("[IP-POOL] Released %s\n", ip);
+        LOG("IP-POOL released: %s", ip);
     }
 }
 
 // ─────────────────────────────────────────────
-//  MODULE: SESSION MANAGER  (Phase 3)
+//  MODULE: SESSION MANAGER
 // ─────────────────────────────────────────────
-// Find existing session by client address; returns index or -1
 int session_find(const struct sockaddr_in *addr) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].active &&
@@ -149,14 +159,13 @@ int session_find(const struct sockaddr_in *addr) {
     return -1;
 }
 
-// Allocate new session slot; returns index or -1
 int session_new(const struct sockaddr_in *addr, socklen_t addr_len) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].active) {
             memset(&clients[i], 0, sizeof(clients[i]));
-            clients[i].active   = 1;
-            clients[i].addr     = *addr;
-            clients[i].addr_len = addr_len;
+            clients[i].active    = 1;
+            clients[i].addr      = *addr;
+            clients[i].addr_len  = addr_len;
             clients[i].last_seen = time(NULL);
             return i;
         }
@@ -172,11 +181,10 @@ void session_free(int idx) {
     }
     if (strlen(clients[idx].virtual_ip) > 0)
         ip_release(clients[idx].virtual_ip);
-    printf("[SESSION] Freed session %d (was %s)\n", idx, clients[idx].virtual_ip);
+    LOG("Freed session %d (was %s)", idx, clients[idx].virtual_ip);
     memset(&clients[idx], 0, sizeof(clients[idx]));
 }
 
-// Background thread: reap timed-out sessions
 void *session_reaper(void *arg) {
     (void)arg;
     while (running) {
@@ -185,7 +193,7 @@ void *session_reaper(void *arg) {
         pthread_mutex_lock(&clients_lock);
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && (now - clients[i].last_seen) > SESSION_TIMEOUT) {
-                printf("[REAPER] Session %d (%s) timed out\n", i, clients[i].virtual_ip);
+                LOG("REAPER: Session %d (%s) timed out", i, clients[i].virtual_ip);
                 session_free(i);
             }
         }
@@ -292,42 +300,78 @@ void derive_aes_key(const unsigned char *secret, size_t len, unsigned char *out)
 
 // ─────────────────────────────────────────────
 //  MODULE: NAT / INTERNET ROUTING  (Phase 4)
+//  AWS: uses IMDSv2 to auto-detect WAN interface
 // ─────────────────────────────────────────────
-// Call once at startup with the real outbound interface (e.g. "eth0")
-void setup_nat(const char *wan_iface, const char *tun_iface) {
-    char cmd[512];
-
-    printf("[NAT] Enabling IP forwarding...\n");
-    system("echo 1 > /proc/sys/net/ipv4/ip_forward");
-    // Persist across reboots
-    system("sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1");
-
-    printf("[NAT] Adding iptables MASQUERADE rule on %s...\n", wan_iface);
-    snprintf(cmd, sizeof(cmd),
-             "iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o %s -j MASQUERADE",
-             wan_iface);
-    system(cmd);
-
-    printf("[NAT] Allowing forwarded traffic...\n");
-    snprintf(cmd, sizeof(cmd),
-             "iptables -A FORWARD -i %s -o %s -j ACCEPT", tun_iface, wan_iface);
-    system(cmd);
-    snprintf(cmd, sizeof(cmd),
-             "iptables -A FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT",
-             wan_iface, tun_iface);
-    system(cmd);
-
-    printf("[NAT] ✅ NAT configured: VPN clients can now reach the internet via %s\n", wan_iface);
+// Auto-detect primary WAN interface (works on both AWS and bare metal)
+void detect_wan_interface(char *iface, size_t iface_len) {
+    FILE *fp = popen("ip route show default | awk '/default/ {print $5}' | head -1", "r");
+    if (fp) {
+        if (fgets(iface, iface_len, fp)) {
+            iface[strcspn(iface, "\n")] = 0;
+        }
+        pclose(fp);
+    }
+    // Fallback common names
+    if (strlen(iface) == 0) {
+        // Try AWS typical interface names
+        const char *candidates[] = {"ens5", "eth0", "enp0s3", NULL};
+        for (int i = 0; candidates[i]; i++) {
+            char check[128];
+            snprintf(check, sizeof(check), "ip link show %s > /dev/null 2>&1", candidates[i]);
+            if (system(check) == 0) {
+                strncpy(iface, candidates[i], iface_len - 1);
+                break;
+            }
+        }
+    }
 }
 
-// Configure the TUN interface IP programmatically
+void setup_nat(const char *wan_iface, const char *tun_iface) {
+    char cmd[512];
+    LOG("NAT: Enabling IP forwarding...");
+    system("echo 1 > /proc/sys/net/ipv4/ip_forward");
+    system("sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1");
+    // Persist across reboots
+    system("grep -q 'net.ipv4.ip_forward' /etc/sysctl.conf || "
+           "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf");
+
+    LOG("NAT: Adding iptables MASQUERADE on %s...", wan_iface);
+    snprintf(cmd, sizeof(cmd),
+             "iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o %s -j MASQUERADE 2>/dev/null || "
+             "iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o %s -j MASQUERADE",
+             wan_iface, wan_iface);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd),
+             "iptables -C FORWARD -i %s -o %s -j ACCEPT 2>/dev/null || "
+             "iptables -A FORWARD -i %s -o %s -j ACCEPT",
+             tun_iface, wan_iface, tun_iface, wan_iface);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd),
+             "iptables -C FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || "
+             "iptables -A FORWARD -i %s -o %s -m state --state RELATED,ESTABLISHED -j ACCEPT",
+             wan_iface, tun_iface, wan_iface, tun_iface);
+    system(cmd);
+
+    // Save iptables rules (so they survive reboot)
+    system("which iptables-save > /dev/null 2>&1 && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true");
+    system("which netfilter-persistent > /dev/null 2>&1 && netfilter-persistent save 2>/dev/null || true");
+
+    LOG("NAT: ✅ Configured — VPN clients can reach the internet via %s", wan_iface);
+}
+
 void configure_tun(const char *dev) {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ip addr add %s/24 dev %s 2>/dev/null || true", VPN_SERVER_IP, dev);
+    snprintf(cmd, sizeof(cmd),
+             "ip addr show %s | grep -q '%s' || ip addr add %s/24 dev %s",
+             dev, VPN_SERVER_IP, VPN_SERVER_IP, dev);
     system(cmd);
     snprintf(cmd, sizeof(cmd), "ip link set %s up", dev);
     system(cmd);
-    printf("[TUN] Interface %s configured with %s/24\n", dev, VPN_SERVER_IP);
+    // Raise MTU slightly lower than default to avoid fragmentation over UDP tunnel
+    snprintf(cmd, sizeof(cmd), "ip link set %s mtu 1420", dev);
+    system(cmd);
+    LOG("TUN %s configured: %s/24  MTU=1420", dev, VPN_SERVER_IP);
 }
 
 // ─────────────────────────────────────────────
@@ -340,34 +384,27 @@ void handle_handshake(int sock, int idx,
     unsigned short payload_len = ntohs(msg->length);
 
     if ((size_t)(n - sizeof(message_t)) < payload_len) {
-        fprintf(stderr, "[HANDSHAKE] Truncated handshake from client %d\n", idx);
+        LOG_ERR("Truncated handshake from client %d", idx);
         return;
     }
 
-    // Generate server DH key
     clients[idx].dh_key = generate_dh_key();
-    if (!clients[idx].dh_key) {
-        fprintf(stderr, "[HANDSHAKE] DH key generation failed\n");
-        return;
-    }
+    if (!clients[idx].dh_key) { LOG_ERR("DH key generation failed"); return; }
 
-    // Derive shared secret using client's pubkey
     unsigned char shared_secret[DH_KEY_SIZE];
     size_t secret_len = sizeof(shared_secret);
-    if (derive_shared_secret(clients[idx].dh_key,
-                             msg->data, payload_len,
+    if (derive_shared_secret(clients[idx].dh_key, msg->data, payload_len,
                              shared_secret, &secret_len) < 0) {
-        fprintf(stderr, "[HANDSHAKE] Failed to derive shared secret\n");
+        LOG_ERR("Failed to derive shared secret for session %d", idx);
         return;
     }
     derive_aes_key(shared_secret, secret_len, clients[idx].aes_key);
-    printf("[HANDSHAKE] Session %d: AES-256-GCM key derived\n", idx);
+    LOG("Session %d: AES-256-GCM key derived", idx);
 
-    // Send server pubkey
     unsigned char *srv_pub = NULL;
     int srv_pub_len = i2d_PUBKEY(clients[idx].dh_key, &srv_pub);
     if (srv_pub_len <= 0 || srv_pub_len > (int)(ENC_BUF_SIZE - sizeof(message_t))) {
-        fprintf(stderr, "[HANDSHAKE] Server pubkey serialization failed\n");
+        LOG_ERR("Server pubkey serialization failed");
         OPENSSL_free(srv_pub);
         return;
     }
@@ -380,21 +417,18 @@ void handle_handshake(int sock, int idx,
            (struct sockaddr *)cli_addr, cli_len);
     OPENSSL_free(srv_pub);
 
-    // Free DH key — no longer needed
     EVP_PKEY_free(clients[idx].dh_key);
     clients[idx].dh_key = NULL;
 
-    // Allocate virtual IP  (IP ALLOCATOR — Phase 2)
     if (!ip_allocate(clients[idx].virtual_ip, sizeof(clients[idx].virtual_ip))) {
-        fprintf(stderr, "[IP-POOL] Pool exhausted! Rejecting client %d\n", idx);
+        LOG_ERR("IP pool exhausted! Rejecting client %d", idx);
         session_free(idx);
         return;
     }
-    printf("[IP-POOL] Assigned %s to session %d (%s:%d)\n",
-           clients[idx].virtual_ip, idx,
-           inet_ntoa(cli_addr->sin_addr), ntohs(cli_addr->sin_port));
+    LOG("IP-POOL assigned %s to session %d (%s:%d)",
+        clients[idx].virtual_ip, idx,
+        inet_ntoa(cli_addr->sin_addr), ntohs(cli_addr->sin_port));
 
-    // Send IP assignment
     unsigned char ip_buf[ENC_BUF_SIZE];
     message_t *ip_msg = (message_t *)ip_buf;
     size_t ip_str_len = strlen(clients[idx].virtual_ip);
@@ -405,16 +439,14 @@ void handle_handshake(int sock, int idx,
            (struct sockaddr *)cli_addr, cli_len);
 
     clients[idx].handshake_done = 1;
-    printf("[SESSION] Session %d fully established\n", idx);
+    LOG("Session %d fully established", idx);
 }
 
 // ─────────────────────────────────────────────
 //  ROUTE TUN PACKET TO CORRECT CLIENT
 // ─────────────────────────────────────────────
-// Peek at destination IP in plain IP packet and find matching session
 int find_client_by_dst_ip(const unsigned char *pkt, int pkt_len) {
     if (pkt_len < 20) return -1;
-    // IP header: dst at offset 16-19
     char dst[INET_ADDRSTRLEN];
     snprintf(dst, sizeof(dst), "%d.%d.%d.%d",
              pkt[16], pkt[17], pkt[18], pkt[19]);
@@ -432,34 +464,72 @@ int find_client_by_dst_ip(const unsigned char *pkt, int pkt_len) {
 // ─────────────────────────────────────────────
 void handle_signal(int sig) {
     (void)sig;
-    printf("\n[SERVER] Shutting down...\n");
+    LOG("Caught signal, shutting down...");
     running = 0;
+}
+
+// ─────────────────────────────────────────────
+//  PRINT STATUS
+// ─────────────────────────────────────────────
+void print_active_sessions(void) {
+    pthread_mutex_lock(&clients_lock);
+    int count = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (clients[i].active) count++;
+    LOG("Active sessions: %d / %d", count, MAX_CLIENTS);
+    pthread_mutex_unlock(&clients_lock);
+}
+
+void *status_printer(void *arg) {
+    (void)arg;
+    while (running) {
+        sleep(60);
+        print_active_sessions();
+    }
+    return NULL;
 }
 
 // ─────────────────────────────────────────────
 //  MAIN
 // ─────────────────────────────────────────────
 int main(int argc, char *argv[]) {
-    // --setup-nat <wan_iface>  flag for Phase 4 NAT config
-    if (argc >= 3 && strcmp(argv[1], "--setup-nat") == 0) {
-        // Need TUN name to also add forward rules
+    // --setup-nat [wan_iface]  — auto-detects if not given
+    if (argc >= 2 && strcmp(argv[1], "--setup-nat") == 0) {
         char tun_name[IFNAMSIZ] = "tun0";
-        setup_nat(argv[2], tun_name);
-        // Also auto-configure tun
+        char wan[64] = {0};
+        if (argc >= 3) {
+            strncpy(wan, argv[2], sizeof(wan) - 1);
+        } else {
+            detect_wan_interface(wan, sizeof(wan));
+            if (strlen(wan) == 0) {
+                fprintf(stderr, "[ERR] Could not auto-detect WAN interface. "
+                                "Pass it explicitly: --setup-nat eth0\n");
+                return 1;
+            }
+            printf("[NAT] Auto-detected WAN interface: %s\n", wan);
+        }
+        setup_nat(wan, tun_name);
         configure_tun(tun_name);
-        printf("[NAT] NAT setup complete. Now run server normally: sudo ./vpnserver\n");
+        printf("[NAT] Setup complete. Run server: sudo ./vpnserver\n");
         return 0;
+    }
+
+    // --syslog flag for systemd / daemon mode
+    if (argc >= 2 && strcmp(argv[1], "--syslog") == 0) {
+        use_syslog = 1;
+        openlog("vpnserver", LOG_PID, LOG_DAEMON);
     }
 
     signal(SIGINT,  handle_signal);
     signal(SIGTERM, handle_signal);
+    signal(SIGPIPE, SIG_IGN);   // ignore broken pipe
 
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
     memset(clients, 0, sizeof(clients));
     memset(ip_pool_used, 0, sizeof(ip_pool_used));
 
-    // Create TUN
+    // Create and configure TUN
     char tun_name[IFNAMSIZ] = "tun0";
     tun_fd_global = tun_alloc(tun_name);
     configure_tun(tun_name);
@@ -468,9 +538,13 @@ int main(int argc, char *argv[]) {
     sock_global = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock_global < 0) { perror("socket"); exit(1); }
 
-    // Allow address reuse
     int opt = 1;
     setsockopt(sock_global, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Increase socket buffers for throughput
+    int bufsize = 4 * 1024 * 1024;  // 4 MB
+    setsockopt(sock_global, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(sock_global, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
 
     struct sockaddr_in srv_addr;
     memset(&srv_addr, 0, sizeof(srv_addr));
@@ -482,19 +556,21 @@ int main(int argc, char *argv[]) {
     }
 
     printf("╔══════════════════════════════════════════╗\n");
-    printf("║   Lightweight VPN Server  (Full Build)   ║\n");
+    printf("║   Lightweight VPN Server  (AWS Build)    ║\n");
     printf("║   Phase 2+3+4  |  AES-256-GCM  |  DH    ║\n");
     printf("╚══════════════════════════════════════════╝\n");
-    printf("[SERVER] Listening on UDP port %d\n", PORT);
-    printf("[SERVER] Max clients: %d  |  IP pool: %s.%d-%d\n",
-           MAX_CLIENTS, VPN_SUBNET, IP_POOL_START, IP_POOL_END);
-    printf("[SERVER] Session timeout: %d seconds\n", SESSION_TIMEOUT);
-    printf("[TIP]  For internet routing run: sudo ./vpnserver --setup-nat <wan_iface>\n\n");
+    LOG("Listening on UDP port %d", PORT);
+    LOG("Max clients: %d  |  IP pool: %s.%d-%d",
+        MAX_CLIENTS, VPN_SUBNET, IP_POOL_START, IP_POOL_END);
+    LOG("Session timeout: %d seconds", SESSION_TIMEOUT);
+    printf("[TIP] For internet routing: sudo ./vpnserver --setup-nat\n\n");
 
-    // Start session reaper thread (Phase 3)
-    pthread_t reaper_tid;
+    // Background threads
+    pthread_t reaper_tid, status_tid;
     pthread_create(&reaper_tid, NULL, session_reaper, NULL);
     pthread_detach(reaper_tid);
+    pthread_create(&status_tid, NULL, status_printer, NULL);
+    pthread_detach(status_tid);
 
     unsigned char buf[ENC_BUF_SIZE];
     unsigned char plain[BUFFER_SIZE];
@@ -507,7 +583,7 @@ int main(int argc, char *argv[]) {
         FD_SET(tun_fd_global, &rfds);
         int maxfd = tun_fd_global > sock_global ? tun_fd_global : sock_global;
 
-        struct timeval tv = {1, 0};   // 1s timeout to check running flag
+        struct timeval tv = {1, 0};
         int ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) { if (errno == EINTR) continue; perror("select"); continue; }
 
@@ -526,18 +602,15 @@ int main(int argc, char *argv[]) {
             int idx = session_find(&cli_addr);
 
             if (msg->type == MSG_HANDSHAKE_INIT) {
-                if (idx >= 0) {
-                    // Re-handshake: clean up old session
-                    session_free(idx);
-                }
+                if (idx >= 0) session_free(idx);
                 idx = session_new(&cli_addr, cli_len);
                 if (idx < 0) {
-                    fprintf(stderr, "[SERVER] No free session slots!\n");
+                    LOG_ERR("No free session slots!");
                     pthread_mutex_unlock(&clients_lock);
                     continue;
                 }
-                printf("[SESSION] New client %s:%d → slot %d\n",
-                       inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), idx);
+                LOG("New client %s:%d → slot %d",
+                    inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), idx);
                 handle_handshake(sock_global, idx, buf, n, &cli_addr, cli_len);
                 pthread_mutex_unlock(&clients_lock);
                 continue;
@@ -545,19 +618,18 @@ int main(int argc, char *argv[]) {
 
             if (idx < 0 || !clients[idx].handshake_done) {
                 pthread_mutex_unlock(&clients_lock);
-                continue;   // unknown client or incomplete handshake
+                continue;
             }
 
             clients[idx].last_seen = time(NULL);
 
             if (msg->type == MSG_KEEPALIVE) {
-                // Just update last_seen; no reply needed
                 pthread_mutex_unlock(&clients_lock);
                 continue;
             }
 
             if (msg->type == MSG_DISCONNECT) {
-                printf("[SESSION] Client %d disconnected gracefully\n", idx);
+                LOG("Client %d disconnected gracefully", idx);
                 session_free(idx);
                 pthread_mutex_unlock(&clients_lock);
                 continue;
@@ -569,7 +641,7 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 unsigned char iv[AES_IV_SIZE], tag[AES_TAG_SIZE];
-                memcpy(iv,  msg->data,                AES_IV_SIZE);
+                memcpy(iv,  msg->data,               AES_IV_SIZE);
                 memcpy(tag, msg->data + AES_IV_SIZE,  AES_TAG_SIZE);
                 int clen = payload_len - AES_IV_SIZE - AES_TAG_SIZE;
                 if (clen <= 0) { pthread_mutex_unlock(&clients_lock); continue; }
@@ -579,10 +651,8 @@ int main(int argc, char *argv[]) {
                                            clen, tag, iv, plain);
                 if (plen > 0) {
                     write(tun_fd_global, plain, plen);
-                    printf("[UDP→TUN] Session %d (%s): %d bytes decrypted\n",
-                           idx, clients[idx].virtual_ip, plen);
                 } else {
-                    fprintf(stderr, "[CRYPTO] Decrypt failed for session %d\n", idx);
+                    LOG_ERR("Decrypt failed for session %d", idx);
                 }
             }
             pthread_mutex_unlock(&clients_lock);
@@ -595,43 +665,34 @@ int main(int argc, char *argv[]) {
 
             pthread_mutex_lock(&clients_lock);
             int idx = find_client_by_dst_ip(plain, n);
-            if (idx < 0) {
-                // Broadcast to all connected clients (e.g. ARP, unknown dst)
-                // For simplicity, drop unknown destinations
-                pthread_mutex_unlock(&clients_lock);
-                continue;
-            }
+            if (idx < 0) { pthread_mutex_unlock(&clients_lock); continue; }
 
             unsigned char iv[AES_IV_SIZE], tag[AES_TAG_SIZE];
             if (RAND_bytes(iv, AES_IV_SIZE) != 1) {
                 pthread_mutex_unlock(&clients_lock);
                 continue;
             }
-            int clen = aes_gcm_encrypt(clients[idx].aes_key, plain, n,
-                                       iv, cipher, tag);
+            int clen = aes_gcm_encrypt(clients[idx].aes_key, plain, n, iv, cipher, tag);
             if (clen > 0) {
                 message_t *dmsg = (message_t *)buf;
-                int payload_len = AES_IV_SIZE + AES_TAG_SIZE + clen;
+                int plen = AES_IV_SIZE + AES_TAG_SIZE + clen;
                 dmsg->type   = MSG_DATA;
-                dmsg->length = htons((unsigned short)payload_len);
-                memcpy(dmsg->data,                           iv,     AES_IV_SIZE);
-                memcpy(dmsg->data + AES_IV_SIZE,             tag,    AES_TAG_SIZE);
+                dmsg->length = htons((unsigned short)plen);
+                memcpy(dmsg->data,                              iv,     AES_IV_SIZE);
+                memcpy(dmsg->data + AES_IV_SIZE,                tag,    AES_TAG_SIZE);
                 memcpy(dmsg->data + AES_IV_SIZE + AES_TAG_SIZE, cipher, clen);
-                sendto(sock_global, buf, sizeof(message_t) + payload_len, 0,
+                sendto(sock_global, buf, sizeof(message_t) + plen, 0,
                        (struct sockaddr *)&clients[idx].addr, clients[idx].addr_len);
-                printf("[TUN→UDP] Session %d (%s): %d bytes encrypted\n",
-                       idx, clients[idx].virtual_ip, n);
             }
             pthread_mutex_unlock(&clients_lock);
         }
     }
 
     // Cleanup
-    printf("[SERVER] Cleaning up sessions...\n");
+    LOG("Cleaning up %d sessions...", MAX_CLIENTS);
     pthread_mutex_lock(&clients_lock);
-    for (int i = 0; i < MAX_CLIENTS; i++) {
+    for (int i = 0; i < MAX_CLIENTS; i++)
         if (clients[i].active) session_free(i);
-    }
     pthread_mutex_unlock(&clients_lock);
 
     close(tun_fd_global);
@@ -639,6 +700,7 @@ int main(int argc, char *argv[]) {
     EVP_cleanup();
     CRYPTO_cleanup_all_ex_data();
     ERR_free_strings();
-    printf("[SERVER] Goodbye.\n");
+    if (use_syslog) closelog();
+    LOG("Goodbye.");
     return 0;
 }
