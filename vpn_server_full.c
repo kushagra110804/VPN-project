@@ -26,7 +26,10 @@
 #include <openssl/pem.h>
 #include <openssl/err.h>
 #include <time.h>
-#include <syslog.h>
+// NOTE: <syslog.h> removed — it defines LOG_ERR as integer 3, which conflicts
+// with our logging macro of the same name.  If you need actual syslog calls,
+// include <syslog.h> and use openlog/syslog/closelog directly; keep your own
+// error macro named VPN_ERR (or anything that doesn't clash with syslog names).
 
 // ─────────────────────────────────────────────
 //  CONFIGURATION
@@ -55,9 +58,11 @@
 
 // ─────────────────────────────────────────────
 //  LOGGING
+//  FIX: LOG_ERR collides with syslog.h's "#define LOG_ERR 3".
+//       Renamed to VPN_LOG / VPN_ERR throughout.
 // ─────────────────────────────────────────────
-#define LOG(fmt, ...)      printf("[VPN] " fmt "\n", ##__VA_ARGS__)
-#define LOG_ERR(fmt, ...)  fprintf(stderr, "[VPN-ERR] " fmt "\n", ##__VA_ARGS__)
+#define VPN_LOG(fmt, ...)  printf("[VPN] " fmt "\n", ##__VA_ARGS__)
+#define VPN_ERR(fmt, ...)  fprintf(stderr, "[VPN-ERR] " fmt "\n", ##__VA_ARGS__)
 
 // ─────────────────────────────────────────────
 //  DATA STRUCTURES
@@ -117,14 +122,14 @@ void detect_wan_interface(char *iface, size_t iface_len) {
 void auto_setup_nat(const char *wan_iface, const char *tun_iface) {
     char cmd[512];
 
-    LOG("NAT: Enabling IP forwarding...");
+    VPN_LOG("NAT: Enabling IP forwarding...");
     system("echo 1 > /proc/sys/net/ipv4/ip_forward");
     system("sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1");
     // Persist
     system("grep -q 'net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null || "
            "echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf");
 
-    LOG("NAT: Configuring iptables on interface %s...", wan_iface);
+    VPN_LOG("NAT: Configuring iptables on interface %s...", wan_iface);
 
     // MASQUERADE — add only if not already present
     snprintf(cmd, sizeof(cmd),
@@ -145,7 +150,7 @@ void auto_setup_nat(const char *wan_iface, const char *tun_iface) {
         wan_iface, tun_iface, wan_iface, tun_iface);
     system(cmd);
 
-    LOG("NAT: ✅ Done — VPN clients can reach internet via %s", wan_iface);
+    VPN_LOG("NAT: Done — VPN clients can reach internet via %s", wan_iface);
 }
 
 // ─────────────────────────────────────────────
@@ -162,7 +167,7 @@ int tun_alloc(char *dev) {
         perror("ioctl TUNSETIFF"); close(fd); exit(1);
     }
     strcpy(dev, ifr.ifr_name);
-    LOG("Created TUN interface: %s", dev);
+    VPN_LOG("Created TUN interface: %s", dev);
     return fd;
 }
 
@@ -176,7 +181,7 @@ void configure_tun(const char *dev) {
     system(cmd);
     snprintf(cmd, sizeof(cmd), "ip link set %s mtu 1420", dev);
     system(cmd);
-    LOG("TUN %s configured: %s/24  MTU=1420", dev, VPN_SERVER_IP);
+    VPN_LOG("TUN %s configured: %s/24  MTU=1420", dev, VPN_SERVER_IP);
 }
 
 // ─────────────────────────────────────────────
@@ -204,7 +209,7 @@ void ip_release(const char *ip) {
         pthread_mutex_lock(&clients_lock);
         ip_pool_used[octet] = 0;
         pthread_mutex_unlock(&clients_lock);
-        LOG("IP-POOL released: %s", ip);
+        VPN_LOG("IP-POOL released: %s", ip);
     }
 }
 
@@ -239,7 +244,7 @@ void session_free(int idx) {
     if (idx < 0 || idx >= MAX_CLIENTS) return;
     if (clients[idx].dh_key) { EVP_PKEY_free(clients[idx].dh_key); clients[idx].dh_key = NULL; }
     if (strlen(clients[idx].virtual_ip) > 0) ip_release(clients[idx].virtual_ip);
-    LOG("Freed session %d (%s)", idx, clients[idx].virtual_ip);
+    VPN_LOG("Freed session %d (%s)", idx, clients[idx].virtual_ip);
     memset(&clients[idx], 0, sizeof(clients[idx]));
 }
 
@@ -251,7 +256,7 @@ void *session_reaper(void *arg) {
         pthread_mutex_lock(&clients_lock);
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].active && (now - clients[i].last_seen) > SESSION_TIMEOUT) {
-                LOG("REAPER: session %d (%s) timed out", i, clients[i].virtual_ip);
+                VPN_LOG("REAPER: session %d (%s) timed out", i, clients[i].virtual_ip);
                 session_free(i);
             }
         }
@@ -368,7 +373,7 @@ void handle_handshake(int sock, int idx,
     if (derive_shared_secret(clients[idx].dh_key, msg->data, payload_len,
                              shared_secret, &secret_len) < 0) return;
     derive_aes_key(shared_secret, secret_len, clients[idx].aes_key);
-    LOG("Session %d: AES-256-GCM key derived", idx);
+    VPN_LOG("Session %d: AES-256-GCM key derived", idx);
 
     // Send server pubkey
     unsigned char *srv_pub = NULL;
@@ -388,9 +393,9 @@ void handle_handshake(int sock, int idx,
 
     // Assign IP
     if (!ip_allocate(clients[idx].virtual_ip, sizeof(clients[idx].virtual_ip))) {
-        LOG_ERR("IP pool exhausted!"); session_free(idx); return;
+        VPN_ERR("IP pool exhausted!"); session_free(idx); return;
     }
-    LOG("IP-POOL: assigned %s to session %d (%s:%d)",
+    VPN_LOG("IP-POOL: assigned %s to session %d (%s:%d)",
         clients[idx].virtual_ip, idx,
         inet_ntoa(cli_addr->sin_addr), ntohs(cli_addr->sin_port));
 
@@ -405,7 +410,7 @@ void handle_handshake(int sock, int idx,
            (struct sockaddr *)cli_addr, cli_len);
 
     clients[idx].handshake_done = 1;
-    LOG("Session %d fully established ✅", idx);
+    VPN_LOG("Session %d fully established", idx);
 }
 
 // ─────────────────────────────────────────────
@@ -429,7 +434,7 @@ int find_client_by_dst(const unsigned char *pkt, int len) {
 // ─────────────────────────────────────────────
 void handle_signal(int sig) {
     (void)sig;
-    LOG("Signal caught — shutting down...");
+    VPN_LOG("Signal caught — shutting down...");
     running = 0;
 }
 
@@ -458,14 +463,14 @@ int main(int argc, char *argv[]) {
         char wan[64] = {0};
         detect_wan_interface(wan, sizeof(wan));
         if (strlen(wan) > 0) {
-            LOG("Auto-detected WAN interface: %s", wan);
+            VPN_LOG("Auto-detected WAN interface: %s", wan);
             auto_setup_nat(wan, tun_name);
         } else {
-            LOG_ERR("Could not detect WAN interface — NAT skipped");
-            LOG_ERR("Run manually: sudo ./vpnserver --no-nat  and set up NAT yourself");
+            VPN_ERR("Could not detect WAN interface — NAT skipped");
+            VPN_ERR("Run manually: sudo ./vpnserver --no-nat  and set up NAT yourself");
         }
     } else {
-        LOG("--no-nat flag set: skipping NAT setup");
+        VPN_LOG("--no-nat flag set: skipping NAT setup");
     }
 
     // UDP socket
@@ -490,11 +495,11 @@ int main(int argc, char *argv[]) {
     printf("║   Lightweight VPN Server  (AUTO Build)   ║\n");
     printf("║   Phase 2+3+4  |  AES-256-GCM  |  DH    ║\n");
     printf("╚══════════════════════════════════════════╝\n");
-    LOG("Listening on UDP port %d", PORT);
-    LOG("Max clients: %d  |  IP pool: %s.%d-%d",
+    VPN_LOG("Listening on UDP port %d", PORT);
+    VPN_LOG("Max clients: %d  |  IP pool: %s.%d-%d",
         MAX_CLIENTS, VPN_SUBNET, IP_POOL_START, IP_POOL_END);
-    LOG("Session timeout: %d seconds", SESSION_TIMEOUT);
-    LOG("✅ Ready — clients can connect now!\n");
+    VPN_LOG("Session timeout: %d seconds", SESSION_TIMEOUT);
+    VPN_LOG("Ready — clients can connect now!\n");
 
     // Background reaper thread
     pthread_t reaper_tid;
@@ -534,11 +539,11 @@ int main(int argc, char *argv[]) {
                 if (idx >= 0) session_free(idx);
                 idx = session_new(&cli_addr, cli_len);
                 if (idx < 0) {
-                    LOG_ERR("No free slots!");
+                    VPN_ERR("No free slots!");
                     pthread_mutex_unlock(&clients_lock);
                     continue;
                 }
-                LOG("New client %s:%d → slot %d",
+                VPN_LOG("New client %s:%d -> slot %d",
                     inet_ntoa(cli_addr.sin_addr), ntohs(cli_addr.sin_port), idx);
                 handle_handshake(sock_global, idx, buf, n, &cli_addr, cli_len);
                 pthread_mutex_unlock(&clients_lock);
@@ -556,7 +561,7 @@ int main(int argc, char *argv[]) {
                 pthread_mutex_unlock(&clients_lock); continue;
             }
             if (msg->type == MSG_DISCONNECT) {
-                LOG("Client %d disconnected gracefully", idx);
+                VPN_LOG("Client %d disconnected gracefully", idx);
                 session_free(idx);
                 pthread_mutex_unlock(&clients_lock); continue;
             }
@@ -575,8 +580,10 @@ int main(int argc, char *argv[]) {
                 if (plen > 0)
                     write(tun_fd_global, plain, plen);
                 else
-                    LOG_ERR("Decrypt failed for session %d", idx);
+                    VPN_ERR("Decrypt failed for session %d", idx);
             }
+            /* suppress unused-variable warning for payload_len in non-DATA paths */
+            (void)payload_len;
             pthread_mutex_unlock(&clients_lock);
         }
 
@@ -620,6 +627,6 @@ int main(int argc, char *argv[]) {
     EVP_cleanup();
     CRYPTO_cleanup_all_ex_data();
     ERR_free_strings();
-    LOG("Goodbye.");
+    VPN_LOG("Goodbye.");
     return 0;
 }
